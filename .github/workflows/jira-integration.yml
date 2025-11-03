@@ -129,7 +129,29 @@ jobs:
           ')
           
           # Extract acceptance criteria (adjust customfield ID)
-          ACCEPTANCE_CRITERIA=$(echo "$HTTP_BODY" | jq -r '.fields.customfield_10039 // "N/A"')
+          ACCEPTANCE_CRITERIA=$(echo "$HTTP_BODY" | jq -r '
+  # navigate to the ADF content
+  .fields.customfield_10039.content[]? 
+  | if .type == "paragraph" then
+      [.content[]?.text] | join("")
+    elif .type == "orderedList" then
+      [.content[]? 
+        | ( [.content[]? 
+            | if .type == "paragraph" then
+                (.content[]?.text // "")
+              elif .type == "bulletList" then
+                [.content[]?
+                  | "- " + ([.content[]?.content[]?.text] | join(""))
+                ] | join("\n")
+              else "" end
+          ] | join("\n")
+        )
+      ] | join("\n\n")
+    elif .type == "bulletList" then
+      [.content[]? | "- " + ([.content[]?.content[]?.text] | join(""))] | join("\n")
+    else "" end
+  ' | sed '/^$/d')
+
           
           # Save to output (handle multiline)
           {
