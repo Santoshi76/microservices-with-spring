@@ -12,7 +12,7 @@ public class ProductController {
     @GetMapping(value = "/product")
     public String gettingProduct() {
         List<Object> products = productService.getAllProducts();
-
+        System.out.println(products);
 
         if (products.isEmpty()) {
             return String.valueOf(new ResponseEntity<>(products, HttpStatus.OK));
