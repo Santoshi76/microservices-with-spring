@@ -1,0 +1,294 @@
+name: Jira Integration via Labels
+
+on:
+  pull_request:
+    types: [opened, labeled, unlabeled, synchronize]
+  workflow_dispatch:
+
+permissions:
+  pull-requests: write
+  contents: read
+  issues: write
+
+jobs:
+  fetch-jira-from-label:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Extract Jira ID from Multiple Sources
+        id: extract-jira
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const labels = context.payload.pull_request.labels;
+            console.log('PR Labels:', labels.map(l => l.name));
+            
+            // Look for label matching pattern: jira/PROJ-123 or PROJ-123
+            const jiraLabel = labels.find(label => 
+              /^(jira\/)?[A-Z]+-\d+$/i.test(label.name)
+            );
+            
+            if (!jiraLabel) {
+              console.log('⚠️ No Jira label found');
+              core.setOutput('has_jira', 'false');
+              return;
+            }
+            
+            // Extract just the Jira key (remove jira/ prefix if present)
+            const jiraKey = jiraLabel.name.replace(/^jira\//, '').toUpperCase();
+            console.log('✅ Found Jira key:', jiraKey);
+            
+            core.setOutput('jira_key', jiraKey);
+            core.setOutput('has_jira', 'true');
+
+      - name: Validate Jira Label Exists
+        id: check-label
+        if: steps.extract-jira.outputs.has_jira != 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // Post comment asking for Jira label
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## ⚠️ Missing Jira Label
+            
+              This PR doesn't have a Jira ticket label.
+            
+              **Please add a label in one of these formats:**
+              - \`SCRUM-123\` (direct Jira key)
+              - \`jira/SCRUM-123\` (with prefix)
+            
+              **How to add:**
+              1. Click "Labels" on the right sidebar →
+              2. Search for your Jira ticket (e.g., SCRUM-123)
+              3. Select it
+            
+              The Jira details will be automatically fetched once you add the label.
+            
+              ---
+              *If your Jira ticket label doesn't exist, ask your team lead to create it or add it manually using the format above.*`
+            });
+            
+            // Create a failing status check
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: 'failure',
+              context: 'Jira Integration / Label Required',
+              description: 'Please add Jira ticket label to PR'
+            });
+
+      - name: Fetch Jira Story Details
+        id: jira-fetch
+        if: steps.extract-jira.outputs.has_jira == 'true'
+        run: |
+          JIRA_KEY="${{ steps.extract-jira.outputs.jira_key }}"
+          echo "Fetching Jira details for: $JIRA_KEY"
+          
+          # Fetch from Jira API
+          RESPONSE=$(curl -s -w "\n%{http_code}" -u "${{ secrets.JIRA_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/$JIRA_KEY?fields=summary,description,status,priority,assignee,issuetype,customfield_10039,labels")
+          
+          # Split response and status code
+          HTTP_BODY=$(echo "$RESPONSE" | head -n -1)
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+          
+          echo "HTTP Status: $HTTP_CODE"
+          
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "❌ Failed to fetch Jira details (HTTP $HTTP_CODE)"
+            echo "Response: $HTTP_BODY"
+            exit 1
+          fi
+          
+          # Extract fields
+          SUMMARY=$(echo "$HTTP_BODY" | jq -r '.fields.summary // "N/A"')
+          STATUS=$(echo "$HTTP_BODY" | jq -r '.fields.status.name // "N/A"')
+          PRIORITY=$(echo "$HTTP_BODY" | jq -r '.fields.priority.name // "N/A"')
+          ISSUE_TYPE=$(echo "$HTTP_BODY" | jq -r '.fields.issuetype.name // "N/A"')
+          ASSIGNEE=$(echo "$HTTP_BODY" | jq -r '.fields.assignee.displayName // "Unassigned"')
+          
+          # Extract description (Atlassian Document Format)
+          DESCRIPTION=$(echo "$HTTP_BODY" | jq -r '
+            if .fields.description then
+              [.fields.description.content[]? | 
+                if .type == "paragraph" then
+                  [.content[]? | .text] | join("")
+                elif .type == "bulletList" then
+                  [.content[]? | "• " + (.content[]?.content[]?.text // "")] | join("\n")
+                else "" end
+              ] | join("\n\n")
+            else "N/A" end
+          ')
+          
+          # Extract acceptance criteria (adjust customfield ID)
+          ACCEPTANCE_CRITERIA=$(echo "$HTTP_BODY" | jq -r '.fields.customfield_10039 // "N/A"')
+          
+          # Save to output (handle multiline)
+          {
+            echo "summary=$SUMMARY"
+            echo "status=$STATUS"
+            echo "priority=$PRIORITY"
+            echo "issue_type=$ISSUE_TYPE"
+            echo "assignee=$ASSIGNEE"
+            echo "description<<EOF"
+            echo "$DESCRIPTION"
+            echo "EOF"
+            echo "acceptance_criteria<<EOF"
+            echo "$ACCEPTANCE_CRITERIA"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+          
+          echo "✅ Successfully fetched Jira details"
+
+      - name: Create Success Status Check
+        if: steps.extract-jira.outputs.has_jira == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const jiraKey = '${{ steps.extract-jira.outputs.jira_key }}';
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: 'success',
+              context: 'Jira Integration / Label Validated',
+              description: `Linked to ${jiraKey}`,
+              target_url: '${{ secrets.JIRA_BASE_URL }}/browse/${{ steps.extract-jira.outputs.jira_key }}'
+            });
+
+      - name: Post or Update Jira Context Comment
+        if: steps.extract-jira.outputs.has_jira == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const jiraKey = '${{ steps.extract-jira.outputs.jira_key }}';
+            const jiraUrl = '${{ secrets.JIRA_BASE_URL }}/browse/' + jiraKey;
+            const summary = `${{ steps.jira-fetch.outputs.summary }}`;
+            const status = `${{ steps.jira-fetch.outputs.status }}`;
+            const priority = `${{ steps.jira-fetch.outputs.priority }}`;
+            const issueType = `${{ steps.jira-fetch.outputs.issue_type }}`;
+            const assignee = `${{ steps.jira-fetch.outputs.assignee }}`;
+            const description = `${{ steps.jira-fetch.outputs.description }}`;
+            const acceptanceCriteria = `${{ steps.jira-fetch.outputs.acceptance_criteria }}`;
+            
+            const comment = `## 📋 Jira Story Context
+            
+            | Field | Value |
+            |-------|-------|
+            | **Story** | [${jiraKey}](${jiraUrl}) 🔗 |
+            | **Type** | ${issueType} |
+            | **Status** | \`${status}\` |
+            | **Priority** | ${priority} |
+            | **Assignee** | ${assignee} |
+            
+            ### 📝 Summary
+            ${summary}
+            
+            ### 📖 Description
+            ${description}
+            
+            ### ✅ Acceptance Criteria
+            ${acceptanceCriteria}
+            
+            ---
+            
+            ### 🤖 AI Code Review Prompt
+            
+            @github-copilot Please review this PR implementation of **${jiraKey}** ensuring:
+            
+            1. ✅ **Requirements Coverage**: All items in the description are implemented
+            2. ✅ **Acceptance Criteria**: Each criterion above is satisfied
+            3. ✅ **Code Quality**: Follows enterprise standards (security, performance, maintainability)
+            4. ✅ **Testing**: Adequate test coverage for the requirements
+            5. ✅ **Edge Cases**: Handles error scenarios appropriately
+            
+            **Issue Type Context (${issueType}):**
+            ${issueType === 'Bug' ? 
+              '- Verify root cause is addressed\n- Check for regression test coverage\n- Validate fix scope is appropriate' : 
+              issueType === 'Story' || issueType === 'Task' ? 
+              '- Confirm feature completeness\n- Review user experience implications\n- Validate edge case handling' :
+              '- Assess implementation approach\n- Check code maintainability\n- Review documentation completeness'}
+            
+            ---
+            <sup>🏷️ Auto-fetched from label: \`${jiraKey}\` • 🔄 Updates when label changes • [Support](YOUR_SUPPORT_LINK)</sup>`;
+            
+            // Find existing bot comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const botComment = comments.find(c => 
+              c.user.type === 'Bot' && 
+              c.body.includes('📋 Jira Story Context')
+            );
+            
+            if (botComment) {
+              // Update existing comment
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: comment
+              });
+              console.log('✅ Updated existing Jira context comment');
+            } else {
+              // Create new comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+              console.log('✅ Created new Jira context comment');
+            }
+
+      - name: Handle Jira Fetch Failure
+        if: failure() && steps.extract-jira.outputs.has_jira == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const jiraKey = '${{ steps.extract-jira.outputs.jira_key }}';
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## ⚠️ Jira Integration Error
+            
+              Failed to fetch details for **${jiraKey}**.
+            
+              **Possible reasons:**
+              - Jira ticket doesn't exist or was deleted
+              - Insufficient permissions to access the ticket
+              - Network connectivity issues
+              - Invalid Jira credentials configured
+            
+              **Next steps:**
+              1. Verify the ticket exists: [${{ secrets.JIRA_BASE_URL }}/browse/${jiraKey}](${{ secrets.JIRA_BASE_URL }}/browse/${jiraKey})
+              2. Check if you have access to view it
+              3. If problem persists, contact DevOps team
+            
+              ---
+              <sup>Error occurred at: ${new Date().toISOString()}</sup>`
+            });
+            
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: 'error',
+              context: 'Jira Integration / Fetch Failed',
+              description: `Could not fetch ${jiraKey} from Jira`
+            });
