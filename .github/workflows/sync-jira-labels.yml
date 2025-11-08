@@ -48,7 +48,7 @@ jobs:
           fi
 
           # Extract tickets safely
-          jq -r '.data.issues[]? | "\(.key)|\(.fields.summary)"' "$RESPONSE_FILE" > "$TICKETS_FILE"
+          jq -r '.issues[]? | "\(.key)|\(.fields.summary)"' "$RESPONSE_FILE" > "$TICKETS_FILE"
           EXIT_CODE=$?
 
           if [ $EXIT_CODE -ne 0 ] || [ ! -s "$TICKETS_FILE" ]; then
