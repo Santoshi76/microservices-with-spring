@@ -26,7 +26,9 @@ jobs:
           echo "=================="
 
           echo "$RESPONSE" | jq -r '.issues[] | "\(.key)|\(.fields.summary)"' > jira_tickets.txt
-          cat jira_tickets.txt
+          cat jq_error.log || true
+          cat jira_tickets.txt || true
+
 
       - name: Create/Update GitHub Labels
         uses: actions/github-script@v7
