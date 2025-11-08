@@ -96,10 +96,10 @@ jobs:
 
 This PR is not linked to a Jira ticket. Please link it using one of these methods:
 
-### 🏷️ Method 1: Add a Label (Recommended)
-1. Click **"Labels"** in the right sidebar →
-2. Search for your Jira ticket (e.g., \`SCRUM-123\`)
-3. Select it
+# 🏷️ Method 1: Add a Label (Recommended)
+# 1. Click "Labels" in the right sidebar →
+# 2. Search for your Jira ticket (e.g., SCRUM-123)
+# 3. Select it
 
 ### 🌿 Method 2: Include in Branch Name
 Create branch with pattern: \`feature/SCRUM-123-description\`
