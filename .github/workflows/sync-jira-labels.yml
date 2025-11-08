@@ -21,6 +21,10 @@ jobs:
             -H "Content-Type: application/json" \
             "${{ secrets.JIRA_BASE_URL }}/rest/api/3/search?jql=project=SCRUM AND status!=Done AND status!=Closed&fields=key,summary&maxResults=100")
           
+          echo "=== RESPONSE ==="
+          echo "$RESPONSE"
+          echo "================"
+
           echo "$RESPONSE" | jq -r '.issues[] | "\(.key)|\(.fields.summary)"' > jira_tickets.txt
           cat jira_tickets.txt
 
