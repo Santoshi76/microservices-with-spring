@@ -1,18 +1,19 @@
-name: Jira Integration via Labels
+name: Jira PR Automation
 
 on:
   pull_request:
-    types: [opened, labeled, unlabeled, synchronize]
-  workflow_dispatch:
+    types: [opened, reopened, labeled, unlabeled, synchronize, edited]
+  pull_request_target:
+    types: [opened, reopened, labeled, unlabeled]
 
 permissions:
   pull-requests: write
-  contents: write
+  contents: read
   issues: write
   statuses: write
 
 jobs:
-  fetch-jira-from-label:
+  jira-integration:
     runs-on: ubuntu-latest
     
     steps:
@@ -22,256 +23,605 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
+            const prNumber = context.payload.pull_request.number;
+            const prTitle = context.payload.pull_request.title;
+            const prBranch = context.payload.pull_request.head.ref;
             const labels = context.payload.pull_request.labels;
-            console.log('PR Labels:', labels.map(l => l.name));
             
-            // Look for label matching pattern: jira/PROJ-123 or PROJ-123
+            console.log('PR #:', prNumber);
+            console.log('Title:', prTitle);
+            console.log('Branch:', prBranch);
+            console.log('Labels:', labels.map(l => l.name));
+            
+            // Priority 1: Check labels (most reliable)
             const jiraLabel = labels.find(label => 
-              /^(jira\/)?[A-Z]+-\d+$/i.test(label.name)
+              /^(jira\/)?[A-Z]{2,10}-\d+$/i.test(label.name)
             );
             
-            if (!jiraLabel) {
-              console.log('⚠️ No Jira label found');
-              core.setOutput('has_jira', 'false');
-              return;
+            if (jiraLabel) {
+              const jiraKey = jiraLabel.name.replace(/^jira\//, '').toUpperCase();
+              console.log('✅ Found Jira key in LABEL:', jiraKey);
+              core.setOutput('jira_key', jiraKey);
+              core.setOutput('has_jira', 'true');
+              core.setOutput('source', 'label');
+              return { jiraKey, source: 'label' };
             }
             
-            // Extract just the Jira key (remove jira/ prefix if present)
-            const jiraKey = jiraLabel.name.replace(/^jira\//, '').toUpperCase();
-            console.log('✅ Found Jira key:', jiraKey);
+            // Priority 2: Check branch name
+            const branchMatch = prBranch.match(/[A-Z]{2,10}-\d+/i);
+            if (branchMatch) {
+              const jiraKey = branchMatch[0].toUpperCase();
+              console.log('✅ Found Jira key in BRANCH:', jiraKey);
+              core.setOutput('jira_key', jiraKey);
+              core.setOutput('has_jira', 'true');
+              core.setOutput('source', 'branch');
+              return { jiraKey, source: 'branch' };
+            }
             
-            core.setOutput('jira_key', jiraKey);
-            core.setOutput('has_jira', 'true');
+            // Priority 3: Check PR title
+            const titleMatch = prTitle.match(/[A-Z]{2,10}-\d+/i);
+            if (titleMatch) {
+              const jiraKey = titleMatch[0].toUpperCase();
+              console.log('✅ Found Jira key in TITLE:', jiraKey);
+              core.setOutput('jira_key', jiraKey);
+              core.setOutput('has_jira', 'true');
+              core.setOutput('source', 'title');
+              return { jiraKey, source: 'title' };
+            }
+            
+            console.log('⚠️ No Jira key found');
+            core.setOutput('has_jira', 'false');
+            return null;
 
-      - name: Validate Jira Label Exists
-        id: check-label
+      - name: Post Missing Jira Warning
         if: steps.extract-jira.outputs.has_jira != 'true'
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            // Post comment asking for Jira label
-            await github.rest.issues.createComment({
+            const botSignature = '<!-- jira-bot-warning -->';
+            
+            // Check if warning already exists
+            const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `## ⚠️ Missing Jira Label
-            
-              This PR doesn't have a Jira ticket label.
-            
-              **Please add a label in one of these formats:**
-              - \`SCRUM-123\` (direct Jira key)
-              - \`jira/SCRUM-123\` (with prefix)
-            
-              **How to add:**
-              1. Click "Labels" on the right sidebar →
-              2. Search for your Jira ticket (e.g., SCRUM-123)
-              3. Select it
-            
-              The Jira details will be automatically fetched once you add the label.
-            
-              ---
-              *If your Jira ticket label doesn't exist, ask your team lead to create it or add it manually using the format above.*`
+              issue_number: context.payload.pull_request.number,
             });
             
-            // Create a failing status check
+            const existingWarning = comments.find(c => 
+              c.user.type === 'Bot' && c.body.includes(botSignature)
+            );
+            
+            const warningMessage = `## ⚠️ Missing Jira Ticket Link
+
+This PR is not linked to a Jira ticket. Please link it using one of these methods:
+
+### 🏷️ Method 1: Add a Label (Recommended)
+1. Click **"Labels"** in the right sidebar →
+2. Search for your Jira ticket (e.g., \`SCRUM-123\`)
+3. Select it
+
+### 🌿 Method 2: Include in Branch Name
+Create branch with pattern: \`feature/SCRUM-123-description\`
+
+### 📝 Method 3: Include in PR Title
+Format: \`[SCRUM-123] Your PR title\`
+
+---
+
+**Why is this required?**
+- Ensures traceability between code and requirements
+- Enables automated context for code reviews
+- Required for compliance and audit purposes
+
+Once linked, Jira story details will be automatically fetched and posted here.
+
+${botSignature}`;
+
+            if (existingWarning) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingWarning.id,
+                body: warningMessage
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: warningMessage
+              });
+            }
+            
+            // Create failing status check
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
               sha: context.payload.pull_request.head.sha,
               state: 'failure',
-              context: 'Jira Integration / Label Required',
-              description: 'Please add Jira ticket label to PR'
+              context: 'Jira Integration',
+              description: 'Jira ticket link required'
             });
 
       - name: Fetch Jira Story Details
-        id: jira-fetch
+        id: fetch-jira
         if: steps.extract-jira.outputs.has_jira == 'true'
         run: |
           JIRA_KEY="${{ steps.extract-jira.outputs.jira_key }}"
-          echo "Fetching Jira details for: $JIRA_KEY"
+          echo "🔍 Fetching Jira details for: $JIRA_KEY"
           
-          # Fetch from Jira API
-          RESPONSE=$(curl -s -w "\n%{http_code}" -u "${{ secrets.JIRA_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
+          # Fetch from Jira API with error handling
+          HTTP_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" \
+            -u "${{ secrets.JIRA_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
             -H "Content-Type: application/json" \
-            "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/$JIRA_KEY?fields=summary,description,status,priority,assignee,issuetype,customfield_10039,labels")
+            "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/$JIRA_KEY?fields=summary,description,status,priority,assignee,issuetype,labels,components,${{ secrets.JIRA_AC_FIELD_ID }}")
           
-          # Split response and status code
-          HTTP_BODY=$(echo "$RESPONSE" | head -n -1)
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+          # Split response body and HTTP code
+          HTTP_BODY=$(echo "$HTTP_RESPONSE" | sed -e 's/HTTP_CODE\:.*//g')
+          HTTP_CODE=$(echo "$HTTP_RESPONSE" | tr -d '\n' | sed -e 's/.*HTTP_CODE://')
           
           echo "HTTP Status: $HTTP_CODE"
           
-          if [ "$HTTP_CODE" -ne 200 ]; then
-            echo "❌ Failed to fetch Jira details (HTTP $HTTP_CODE)"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Failed to fetch Jira (HTTP $HTTP_CODE)"
             echo "Response: $HTTP_BODY"
+            echo "fetch_failed=true" >> $GITHUB_OUTPUT
             exit 1
           fi
           
-          # Extract fields
+          # Extract fields using jq
           SUMMARY=$(echo "$HTTP_BODY" | jq -r '.fields.summary // "N/A"')
-          STATUS=$(echo "$HTTP_BODY" | jq -r '.fields.status.name // "N/A"')
-          PRIORITY=$(echo "$HTTP_BODY" | jq -r '.fields.priority.name // "N/A"')
-          ISSUE_TYPE=$(echo "$HTTP_BODY" | jq -r '.fields.issuetype.name // "N/A"')
+          STATUS=$(echo "$HTTP_BODY" | jq -r '.fields.status.name // "Unknown"')
+          PRIORITY=$(echo "$HTTP_BODY" | jq -r '.fields.priority.name // "None"')
+          ISSUE_TYPE=$(echo "$HTTP_BODY" | jq -r '.fields.issuetype.name // "Unknown"')
           ASSIGNEE=$(echo "$HTTP_BODY" | jq -r '.fields.assignee.displayName // "Unassigned"')
+          ASSIGNEE_EMAIL=$(echo "$HTTP_BODY" | jq -r '.fields.assignee.emailAddress // ""')
+          LABELS=$(echo "$HTTP_BODY" | jq -r '.fields.labels | join(", ") // "None"')
+          COMPONENTS=$(echo "$HTTP_BODY" | jq -r '[.fields.components[]?.name] | join(", ") // "None"')
           
-          # Extract description (Atlassian Document Format)
+          # Extract description (handle Atlassian Document Format - ADF)
           DESCRIPTION=$(echo "$HTTP_BODY" | jq -r '
             if .fields.description then
               [.fields.description.content[]? | 
                 if .type == "paragraph" then
-                  [.content[]? | .text] | join("")
-                elif .type == "bulletList" then
-                  [.content[]? | "• " + (.content[]?.content[]?.text // "")] | join("\n")
+                  [.content[]? | select(.type == "text") | .text] | join("")
+                elif .type == "bulletList" or .type == "orderedList" then
+                  [.content[]? | "• " + ([.content[]?.content[]? | select(.type == "text") | .text] | join(""))] | join("\n")
+                elif .type == "codeBlock" then
+                  "```\n" + ([.content[]? | .text] | join("")) + "\n```"
                 else "" end
               ] | join("\n\n")
-            else "N/A" end
+            else "No description provided" end
           ')
           
-          # Extract acceptance criteria (adjust customfield ID)
-           ACCEPTANCE_CRITERIA=$(echo "$HTTP_BODY" | jq -r '
-            .fields.customfield_10039.content[]? 
-            | if .type == "paragraph" then
-                [.content[]?.text] | join("")
-              elif .type == "orderedList" then
-                [.content[]?
-                  | ( [.content[]?
-                      | if .type == "paragraph" then
-                          (.content[]?.text // "")
-                        elif .type == "bulletList" then
-                          [.content[]?
-                            | "- " + ([.content[]?.content[]?.text] | join(""))
-                          ] | join("\n")
-                        else "" end
-                    ] | join("\n")
-                  )
-                ] | join("\n\n")
-              elif .type == "bulletList" then
-                [.content[]? | "- " + ([.content[]?.content[]?.text] | join(""))] | join("\n")
-              else "" end
-            ' | sed "/^$/d")
+          # Extract acceptance criteria (adjust field ID)
+          ACCEPTANCE_CRITERIA=$(echo "$HTTP_BODY" | jq -r '
+            if .fields.${{ secrets.JIRA_AC_FIELD_ID }} then
+              if (.fields.${{ secrets.JIRA_AC_FIELD_ID }} | type) == "string" then
+                .fields.${{ secrets.JIRA_AC_FIELD_ID }}
+              elif (.fields.${{ secrets.JIRA_AC_FIELD_ID }} | type) == "object" then
+                [.fields.${{ secrets.JIRA_AC_FIELD_ID }}.content[]?.content[]? | select(.type == "text") | .text] | join("\n")
+              else "N/A" end
+            else "No acceptance criteria defined" end
+          ')
           
-          # Save to output (handle multiline)
+          # Save to GitHub output (handle multiline)
           {
             echo "summary=$SUMMARY"
             echo "status=$STATUS"
             echo "priority=$PRIORITY"
             echo "issue_type=$ISSUE_TYPE"
             echo "assignee=$ASSIGNEE"
-            echo "description<<EOF"
+            echo "assignee_email=$ASSIGNEE_EMAIL"
+            echo "labels=$LABELS"
+            echo "components=$COMPONENTS"
+            echo "description<<EOF_DESC"
             echo "$DESCRIPTION"
-            echo "EOF"
-            echo "acceptance_criteria<<EOF"
+            echo "EOF_DESC"
+            echo "acceptance_criteria<<EOF_AC"
             echo "$ACCEPTANCE_CRITERIA"
-            echo "EOF"
+            echo "EOF_AC"
           } >> $GITHUB_OUTPUT
           
           echo "✅ Successfully fetched Jira details"
 
-      - name: Create Success Status Check
-        if: steps.extract-jira.outputs.has_jira == 'true'
+      - name: Auto-Generate PR Title
+        if: steps.extract-jira.outputs.has_jira == 'true' && steps.fetch-jira.outcome == 'success'
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const jiraKey = '${{ steps.extract-jira.outputs.jira_key }}';
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: context.payload.pull_request.head.sha,
-              state: 'success',
-              context: 'Jira Integration / Label Validated',
-              description: `Linked to ${jiraKey}`,
-              target_url: '${{ secrets.JIRA_BASE_URL }}/browse/${{ steps.extract-jira.outputs.jira_key }}'
-            });
+            const summary = `${{ steps.fetch-jira.outputs.summary }}`;
+            const issueType = '${{ steps.fetch-jira.outputs.issue_type }}';
+            const currentTitle = context.payload.pull_request.title;
+            
+            // Only update if Jira key not in title or title is generic
+            const needsUpdate = !currentTitle.includes(jiraKey) || 
+                               currentTitle.toLowerCase().includes('update') ||
+                               currentTitle.toLowerCase().includes('initial commit');
+            
+            if (needsUpdate) {
+              // Map issue type to conventional commit prefix
+              const typeMap = {
+                'Story': 'feat',
+                'Bug': 'fix',
+                'Task': 'chore',
+                'Epic': 'feat',
+                'Sub-task': 'chore'
+              };
+              
+              const prefix = typeMap[issueType] || 'feat';
+              const newTitle = `${prefix}: [${jiraKey}] ${summary}`;
+              
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                title: newTitle
+              });
+              
+              console.log(`✅ Updated PR title to: ${newTitle}`);
+            } else {
+              console.log('ℹ️ PR title already contains Jira key, skipping update');
+            }
 
-      - name: Post or Update Jira Context Comment
-        if: steps.extract-jira.outputs.has_jira == 'true'
+      - name: Auto-Generate PR Description
+        if: steps.extract-jira.outputs.has_jira == 'true' && steps.fetch-jira.outcome == 'success'
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const jiraKey = '${{ steps.extract-jira.outputs.jira_key }}';
             const jiraUrl = '${{ secrets.JIRA_BASE_URL }}/browse/' + jiraKey;
-            const summary = `${{ steps.jira-fetch.outputs.summary }}`;
-            const status = `${{ steps.jira-fetch.outputs.status }}`;
-            const priority = `${{ steps.jira-fetch.outputs.priority }}`;
-            const issueType = `${{ steps.jira-fetch.outputs.issue_type }}`;
-            const assignee = `${{ steps.jira-fetch.outputs.assignee }}`;
-            const description = `${{ steps.jira-fetch.outputs.description }}`;
-            const acceptanceCriteria = `${{ steps.jira-fetch.outputs.acceptance_criteria }}`;
+            const summary = `${{ steps.fetch-jira.outputs.summary }}`;
+            const description = `${{ steps.fetch-jira.outputs.description }}`;
+            const acceptanceCriteria = `${{ steps.fetch-jira.outputs.acceptance_criteria }}`;
+            const issueType = '${{ steps.fetch-jira.outputs.issue_type }}';
+            const status = '${{ steps.fetch-jira.outputs.status }}';
+            const priority = '${{ steps.fetch-jira.outputs.priority }}';
+            const assignee = '${{ steps.fetch-jira.outputs.assignee }}';
+            const components = '${{ steps.fetch-jira.outputs.components }}';
+            const source = '${{ steps.extract-jira.outputs.source }}';
             
-            const comment = `## 📋 Jira Story Context
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+            });
             
-            | Field | Value |
-            |-------|-------|
-            | **Story** | [${jiraKey}](${jiraUrl}) 🔗 |
-            | **Type** | ${issueType} |
-            | **Status** | \`${status}\` |
-            | **Priority** | ${priority} |
-            | **Assignee** | ${assignee} |
+            const currentBody = pr.body || '';
+            const autoGenMarker = '<!-- auto-generated-jira-content -->';
             
-            ### 📝 Summary
-            ${summary}
+            // Only auto-populate if description is empty or minimal
+            const shouldAutoPopulate = currentBody.length < 100 && !currentBody.includes(autoGenMarker);
             
-            ### 📖 Description
-            ${description}
+            if (shouldAutoPopulate) {
+              const autoDescription = `## 📋 ${jiraKey}: ${summary}
+
+${autoGenMarker}
+
+| | |
+|---|---|
+| **Jira Ticket** | [${jiraKey}](${jiraUrl}) 🔗 |
+| **Type** | ${issueType} |
+| **Status** | \`${status}\` |
+| **Priority** | ${priority} |
+| **Assignee** | ${assignee} |
+| **Components** | ${components} |
+| **Linked via** | ${source} (${source === 'label' ? '🏷️ label' : source === 'branch' ? '🌿 branch name' : '📝 PR title'}) |
+
+---
+
+### 📖 Story Description
+
+${description}
+
+---
+
+### ✅ Acceptance Criteria
+
+${acceptanceCriteria}
+
+---
+
+### 💬 Implementation Notes
+
+<!-- Optional: Add any additional context about your implementation approach, technical decisions, or gotchas -->
+
+---
+
+### 🧪 Testing
+
+<!-- Optional: Describe any manual testing performed beyond automated tests -->
+
+- [ ] Unit tests added/updated
+- [ ] Integration tests added/updated
+- [ ] Manual testing completed
+
+---
+
+### ⚠️ Special Considerations
+
+<!-- Optional: Note any breaking changes, migration needs, or deployment requirements -->
+
+- [ ] No breaking changes
+- [ ] No special deployment steps required
+- [ ] Documentation updated (if needed)
+
+---
+
+<sub>🤖 Auto-generated from Jira • [Edit freely](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/proposing-changes-to-your-work-with-pull-requests/about-pull-requests) • Last synced: ${new Date().toISOString()}</sub>`;
+
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                body: autoDescription
+              });
+              
+              console.log('✅ Auto-populated PR description from Jira');
+            } else {
+              console.log('ℹ️ PR description already exists or was manually edited, skipping auto-population');
+            }
+
+      - name: Auto-Add GitHub Labels
+        if: steps.extract-jira.outputs.has_jira == 'true' && steps.fetch-jira.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issueType = '${{ steps.fetch-jira.outputs.issue_type }}';
+            const priority = '${{ steps.fetch-jira.outputs.priority }}';
+            const components = '${{ steps.fetch-jira.outputs.components }}';
+            const jiraLabels = '${{ steps.fetch-jira.outputs.labels }}'.split(', ').filter(l => l && l !== 'None');
             
-            ### ✅ Acceptance Criteria
-            ${acceptanceCriteria}
+            const labelsToAdd = [];
             
-            ---
+            // Map Jira issue type to GitHub labels
+            const typeMap = {
+              'Story': 'feature',
+              'Bug': 'bug',
+              'Task': 'chore',
+              'Epic': 'epic',
+              'Sub-task': 'sub-task',
+              'Improvement': 'enhancement'
+            };
             
-            ### 🤖 AI Code Review Prompt
+            if (typeMap[issueType]) {
+              labelsToAdd.push(typeMap[issueType]);
+            }
             
-            @github-copilot Please review this PR implementation of **${jiraKey}** ensuring:
+            // Map Jira priority to GitHub labels
+            const priorityMap = {
+              'Highest': 'priority: critical',
+              'High': 'priority: high',
+              'Medium': 'priority: medium',
+              'Low': 'priority: low',
+              'Lowest': 'priority: low'
+            };
             
-            1. ✅ **Requirements Coverage**: All items in the description are implemented
-            2. ✅ **Acceptance Criteria**: Each criterion above is satisfied
-            3. ✅ **Code Quality**: Follows enterprise standards (security, performance, maintainability)
-            4. ✅ **Testing**: Adequate test coverage for the requirements
-            5. ✅ **Edge Cases**: Handles error scenarios appropriately
+            if (priorityMap[priority]) {
+              labelsToAdd.push(priorityMap[priority]);
+            }
             
-            **Issue Type Context (${issueType}):**
-            ${issueType === 'Bug' ? 
-              '- Verify root cause is addressed\n- Check for regression test coverage\n- Validate fix scope is appropriate' : 
-              issueType === 'Story' || issueType === 'Task' ? 
-              '- Confirm feature completeness\n- Review user experience implications\n- Validate edge case handling' :
-              '- Assess implementation approach\n- Check code maintainability\n- Review documentation completeness'}
+            // Add component labels (if they exist in GitHub)
+            if (components && components !== 'None') {
+              const componentList = components.split(', ');
+              componentList.forEach(comp => {
+                labelsToAdd.push(`component: ${comp.toLowerCase()}`);
+              });
+            }
             
-            ---
-            <sup>🏷️ Auto-fetched from label: \`${jiraKey}\` • 🔄 Updates when label changes • [Support](YOUR_SUPPORT_LINK)</sup>`;
+            // Add Jira labels as GitHub labels
+            jiraLabels.forEach(label => {
+              if (label.length > 0 && label.length < 50) {
+                labelsToAdd.push(`jira: ${label.toLowerCase()}`);
+              }
+            });
             
-            // Find existing bot comment
+            // Remove duplicates
+            const uniqueLabels = [...new Set(labelsToAdd)];
+            
+            if (uniqueLabels.length > 0) {
+              try {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  labels: uniqueLabels
+                });
+                console.log(`✅ Added labels: ${uniqueLabels.join(', ')}`);
+              } catch (error) {
+                console.log(`⚠️ Some labels may not exist: ${error.message}`);
+                console.log('Consider creating these labels in your repository');
+              }
+            }
+
+      - name: Post Comprehensive Jira Context
+        if: steps.extract-jira.outputs.has_jira == 'true' && steps.fetch-jira.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const jiraKey = '${{ steps.extract-jira.outputs.jira_key }}';
+            const jiraUrl = '${{ secrets.JIRA_BASE_URL }}/browse/' + jiraKey;
+            const summary = `${{ steps.fetch-jira.outputs.summary }}`;
+            const description = `${{ steps.fetch-jira.outputs.description }}`;
+            const acceptanceCriteria = `${{ steps.fetch-jira.outputs.acceptance_criteria }}`;
+            const issueType = '${{ steps.fetch-jira.outputs.issue_type }}';
+            const status = '${{ steps.fetch-jira.outputs.status }}';
+            const priority = '${{ steps.fetch-jira.outputs.priority }}';
+            const assignee = '${{ steps.fetch-jira.outputs.assignee }}';
+            const source = '${{ steps.extract-jira.outputs.source }}';
+            
+            const botSignature = '<!-- jira-context-comment -->';
+            
+            // Determine review focus based on issue type
+            let reviewFocus = '';
+            switch(issueType) {
+              case 'Bug':
+                reviewFocus = `**Bug Fix Review Focus:**
+- ✅ Root cause is properly addressed
+- ✅ Fix doesn't introduce new issues
+- ✅ Regression tests added
+- ✅ Impact scope is appropriate`;
+                break;
+              case 'Story':
+              case 'Task':
+                reviewFocus = `**Feature Review Focus:**
+- ✅ All acceptance criteria implemented
+- ✅ User experience is intuitive
+- ✅ Edge cases handled
+- ✅ Performance acceptable`;
+                break;
+              default:
+                reviewFocus = `**General Review Focus:**
+- ✅ Code meets requirements
+- ✅ Quality standards maintained
+- ✅ Tests adequate
+- ✅ No unintended side effects`;
+            }
+            
+            const contextComment = `## 🤖 Automated Code Review Context
+
+${botSignature}
+
+This PR implements Jira ticket [**${jiraKey}**](${jiraUrl})
+
+### 📊 Ticket Information
+
+| Field | Value |
+|-------|-------|
+| **Summary** | ${summary} |
+| **Type** | ${issueType} |
+| **Status** | \`${status}\` |
+| **Priority** | ${priority} |
+| **Assignee** | ${assignee} |
+
+### 📝 Requirements
+
+${description}
+
+### ✅ Acceptance Criteria
+
+${acceptanceCriteria}
+
+---
+
+### 🔍 Review Guidelines
+
+${reviewFocus}
+
+**Code Quality Checks:**
+- ✅ SOLID principles followed
+- ✅ Security best practices (no hardcoded secrets, input validation, etc.)
+- ✅ Error handling comprehensive
+- ✅ Performance optimized (no N+1 queries, proper indexing, etc.)
+- ✅ Code is maintainable and well-documented
+
+---
+
+### 🤖 AI-Assisted Review
+
+@github-copilot Please review this PR implementation of **${jiraKey}** with focus on:
+
+1. **Requirements Alignment**: Verify all requirements from the description above are implemented
+2. **Acceptance Criteria**: Confirm each criterion is satisfied
+3. **Code Quality**: Check for security issues, performance problems, and maintainability
+4. **Testing**: Assess test coverage for the requirements
+5. **Best Practices**: Identify any violations of coding standards
+
+Please structure your review with specific line references and actionable feedback.
+
+---
+
+<sub>🔗 Linked via ${source} • 🔄 Auto-updates on label changes • ⚡ Powered by [Jira Integration](https://github.com/YOUR_ORG/.github)</sub>`;
+
+            // Find and update or create comment
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
+              issue_number: context.payload.pull_request.number,
             });
             
-            const botComment = comments.find(c => 
-              c.user.type === 'Bot' && 
-              c.body.includes('📋 Jira Story Context')
+            const existingComment = comments.find(c => 
+              c.user.type === 'Bot' && c.body.includes(botSignature)
             );
             
-            if (botComment) {
-              // Update existing comment
+            if (existingComment) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                comment_id: botComment.id,
-                body: comment
+                comment_id: existingComment.id,
+                body: contextComment
               });
               console.log('✅ Updated existing Jira context comment');
             } else {
-              // Create new comment
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body: comment
+                issue_number: context.payload.pull_request.number,
+                body: contextComment
               });
               console.log('✅ Created new Jira context comment');
+            }
+
+      - name: Create Success Status Check
+        if: steps.extract-jira.outputs.has_jira == 'true' && steps.fetch-jira.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const jiraKey = '${{ steps.extract-jira.outputs.jira_key }}';
+            const jiraUrl = '${{ secrets.JIRA_BASE_URL }}/browse/' + jiraKey;
+            
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: 'success',
+              context: 'Jira Integration',
+              description: `Linked to ${jiraKey}`,
+              target_url: jiraUrl
+            });
+
+      - name: Auto-Request Review from Jira Assignee
+        if: steps.extract-jira.outputs.has_jira == 'true' && steps.fetch-jira.outcome == 'success'
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const assigneeEmail = '${{ steps.fetch-jira.outputs.assignee_email }}';
+            const prAuthor = context.payload.pull_request.user.login;
+            
+            if (!assigneeEmail) {
+              console.log('ℹ️ No Jira assignee email found');
+              return;
+            }
+            
+            // Try to find GitHub user by email (requires user to have public email)
+            try {
+              const { data: users } = await github.rest.search.users({
+                q: `${assigneeEmail} in:email`
+              });
+              
+              if (users.total_count > 0 && users.items[0].login !== prAuthor) {
+                const reviewer = users.items[0].login;
+                
+                await github.rest.pulls.requestReviewers({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: context.payload.pull_request.number,
+                  reviewers: [reviewer]
+                });
+                
+                console.log(`✅ Auto-requested review from Jira assignee: ${reviewer}`);
+              }
+            } catch (error) {
+              console.log(`ℹ️ Could not auto-request review: ${error.message}`);
             }
 
       - name: Handle Jira Fetch Failure
@@ -281,28 +631,30 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const jiraKey = '${{ steps.extract-jira.outputs.jira_key }}';
+            const jiraUrl = '${{ secrets.JIRA_BASE_URL }}/browse/' + jiraKey;
             
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `## ⚠️ Jira Integration Error
-            
-              Failed to fetch details for **${jiraKey}**.
-            
-              **Possible reasons:**
-              - Jira ticket doesn't exist or was deleted
-              - Insufficient permissions to access the ticket
-              - Network connectivity issues
-              - Invalid Jira credentials configured
-            
-              **Next steps:**
-              1. Verify the ticket exists: [${{ secrets.JIRA_BASE_URL }}/browse/${jiraKey}](${{ secrets.JIRA_BASE_URL }}/browse/${jiraKey})
-              2. Check if you have access to view it
-              3. If problem persists, contact DevOps team
-            
-              ---
-              <sup>Error occurred at: ${new Date().toISOString()}</sup>`
+              issue_number: context.payload.pull_request.number,
+              body: `## ❌ Jira Integration Error
+
+Unable to fetch details for [**${jiraKey}**](${jiraUrl}).
+
+**Possible causes:**
+- Ticket doesn't exist or was deleted
+- Insufficient permissions to access the ticket
+- Jira API credentials expired or invalid
+- Network connectivity issue
+
+**Next steps:**
+1. Verify the ticket exists and you have access: [View in Jira](${jiraUrl})
+2. Check that the Jira key is correct: \`${jiraKey}\`
+3. If the issue persists, contact DevOps team or check [troubleshooting guide](YOUR_DOCS_LINK)
+
+---
+
+<sub>⚠️ Error occurred at: ${new Date().toISOString()}</sub>`
             });
             
             await github.rest.repos.createCommitStatus({
@@ -310,6 +662,16 @@ jobs:
               repo: context.repo.repo,
               sha: context.payload.pull_request.head.sha,
               state: 'error',
-              context: 'Jira Integration / Fetch Failed',
-              description: `Could not fetch ${jiraKey} from Jira`
+              context: 'Jira Integration',
+              description: `Failed to fetch ${jiraKey}`
             });
+
+      - name: Delete PR Template if Exists
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // This is just a reminder step
+            console.log('ℹ️ Reminder: Delete .github/pull_request_template.md if it exists');
+            console.log('   This workflow auto-generates PR descriptions, so templates are not needed');
