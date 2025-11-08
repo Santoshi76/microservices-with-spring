@@ -200,14 +200,22 @@ jobs:
             else "No description provided" end
           ')
           
-          # Extract acceptance criteria (adjust field ID)
+          # Extract acceptance criteria from custom field (Atlassian Document Format)
           AC_FIELD_NAME="customfield_${JIRA_AC_FIELD_ID}"
           ACCEPTANCE_CRITERIA=$(echo "$HTTP_BODY" | jq -r --arg field "$AC_FIELD_NAME" '
             if .fields[$field] then
               if (.fields[$field] | type) == "string" then
                 .fields[$field]
-              elif (.fields[$field] | type) == "object" then
-                [.fields[$field].content[]?.content[]? | select(.type == "text") | .text] | join("\n")
+              elif (.fields[$field] | type) == "object" and .fields[$field].content then
+                [.fields[$field].content[] | 
+                  if .type == "paragraph" then
+                    [.content[]? | select(.type == "text") | .text] | join("")
+                  elif .type == "bulletList" or .type == "orderedList" then
+                    [.content[]? | 
+                      "- " + ([.content[]?.content[]? | select(.type == "text") | .text] | join(""))
+                    ] | join("\n")
+                  else "" end
+                ] | join("\n\n") | gsub("^\\s+|\\s+$"; "")
               else "N/A" end
             else "No acceptance criteria defined" end
           ')
